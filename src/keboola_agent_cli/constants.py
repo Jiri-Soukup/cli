@@ -456,6 +456,13 @@ DEFERRED_UPDATE_MAX_WAIT_SECONDS: int = 900
 # A marker older than this whose helper never wrote an exit file is treated as
 # lost (helper killed, machine rebooted mid-wait) and reported once.
 DEFERRED_UPDATE_STALE_SECONDS: int = 86400
+# Text in uv's error chain when a hardlink failed and uv did not fall back
+# ("Caused by: failed to hardlink file from ... (os error 396)", issue #786,
+# OneDrive / cloud-synced volume). The helper retries the install once in copy
+# link mode only when a failed install printed this. Matched case-sensitively:
+# uv's warning "Failed to hardlink files; falling back to full copy" means the
+# fallback worked, so it must not trigger a retry.
+DEFERRED_UPDATE_HARDLINK_FAILURE_TEXT: str = "failed to hardlink file"
 
 # --- Native (frozen / PyInstaller) distribution ---
 # kbagent also ships as a self-contained PyInstaller binary with NO Python
@@ -851,6 +858,28 @@ AUTH_TOKEN_REVOKE_PATH: str = "/v1/auth/token/revoke"
 # which only ever has a session id on hand, never that session's refresh
 # token -- see plan review B-1/B-2).
 AUTH_SESSIONS_PATH: str = "/v1/auth/sessions"
+
+# Agent provisioning (DMD-1940): create a brand-new Keboola project from a
+# machine with no Keboola identity at all. Unauthenticated POST -- the request
+# itself is the credential -- answering a project-pinned, Manage-less
+# programmatic session (the same AT/RT pair every other flow here produces)
+# plus a single-use `confirmUrl` a human opens to take ownership. Gated by the
+# stack feature `agent-provisioning`; a stack without it answers 404.
+#
+# Lives under /manage, not /v1/auth, because the public surface is named
+# "programmatic projects" while the internal feature kept the shipped
+# `agent-provisioning` name (keboola/connection#8081).
+AGENT_PROVISIONING_PATH: str = "/manage/programmatic-projects"
+
+# `--sync-backend-init` holds the provisioning request open until the stack has
+# finished initializing the storage backend, which routinely outlasts the
+# client default read timeout (30 s). Timing out there is the WORST outcome
+# this command has -- the project was created, the response was lost, and the
+# confirm link with it -- so the synchronous variant gets its own budget.
+# Connect/write/pool stay short: only the wait for the body is long.
+AGENT_PROVISIONING_SYNC_TIMEOUT: httpx.Timeout = httpx.Timeout(
+    connect=10.0, read=300.0, write=10.0, pool=5.0
+)
 
 AUTH_DEVICE_DEFAULT_INTERVAL: int = 5  # RFC 8628 default poll interval (s)
 AUTH_DEVICE_MAX_INTERVAL: int = 60  # cap after repeated slow_down

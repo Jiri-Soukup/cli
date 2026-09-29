@@ -255,6 +255,38 @@ Use `kbagent <command> --help` for full flag details and examples.
 
 ### Project Management
 
+  kbagent project create --url URL [--project ALIAS] [--name NAME]
+                         [--backend snowflake|bigquery] [--sync-backend-init]
+    Create a BRAND-NEW Keboola project from a machine with no Keboola
+    identity -- no account, no token, no `auth login` first. The only command
+    here that works from nothing. Needs the `agent-provisioning` stack feature
+    (STACK_FEATURES__AGENT_PROVISIONING), which is OFF on most stacks. The
+    command is always registered, so its presence in --help proves nothing
+    about the stack; without the feature the stack answers 404 and the command
+    exits 1 with AUTH_NOT_SUPPORTED_ON_STACK, naming the flag an operator
+    flips and how to connect an existing project instead.
+    What it does in one call: provisions the project, stores the returned
+    project-pinned session in auth.json, and registers the project in
+    config.json under a session sentinel (as `auth login --register-projects`
+    would). If nothing was registered before, it also becomes the default
+    project -- so the next command needs no --project.
+    THE RESULT IS NOT FINISHED UNTIL A HUMAN CLICKS. The project it creates
+    is owned by NOBODY: `confirm_url` in the result is a single-use link a
+    human must open and sign in at to take ownership, and it expires in days.
+    Relay that URL to the user verbatim -- it is the only path to ownership,
+    and an unclaimed project is a billable orphan. `auth status` re-prints it
+    (`agent_confirm_url`) for as long as it is pending, so a lost terminal is
+    recoverable.
+    Confirmation REVOKES this session. After the human confirms, run
+    `kbagent auth login --stack URL`; the registered alias keeps working
+    because the sentinel is keyed by project id + stack, not by session.
+    Refuses (exit 5, CONFIG_ERROR) when a session for that stack already
+    exists: auth.json holds one session per stack, and anyone who has one has
+    an account already. `--backend` omitted keeps the stack's own default.
+    `--sync-backend-init` waits for backend initialization instead of letting
+    the stack finish it in the background (the async default warns that the
+    first Storage command may fail until it lands).
+
   kbagent project add --project NAME --url URL --token TOKEN
     Add a new project connection. Token verified against API.
 
@@ -672,6 +704,9 @@ remain branch-aware because modifying a dev branch is the expected intent.
     Human mode also renders a Description column in the Columns table (0.89.0+, #642), shown only
     when at least one column carries a description; long text wraps instead of truncating. On
     0.88.0 column descriptions were readable through --json column_details[].description only.
+    Also returns `backend_path` (the owning bucket's Storage backendPath, verbatim) and `sql_path`
+    (the quoted, directly queryable table path; null when Storage reports no location) (since
+    0.95.0, #761). A linked bucket's path is the SOURCE project's database + schema.
 
   kbagent storage create-bucket --project NAME --stage STAGE --name BUCKET_NAME [--description D] [--backend B] [--branch ID]
     Create a new storage bucket. Stage must be "in" or "out". Branch-aware.
@@ -1334,9 +1369,10 @@ remain branch-aware because modifying a dev branch is the expected intent.
   kbagent workspace gc [--project NAME] [--dry-run] [--yes]
     Garbage-collect orphaned workspaces (keboola.sandboxes config missing). Use --dry-run to preview.
 
-### Data Apps (Streamlit / Flask / Node deployments)
+### Data Apps (Python/JS by default; Streamlit via --type)
 
-Lifecycle for `keboola.data-apps`. Combines the Storage API (config body --
+Lifecycle for `keboola.data-apps`. New apps default to `--type python-js`
+(Python, Node, or both), the recommended runtime. Combines the Storage API (config body --
 git block, slug, runtime size, encrypted secrets) with the Data Science API
 (/apps -- deployment record, state, URL, configVersion). Encapsulates the
 §9 redeploy contract so callers cannot pin to the empty-shell v2.
@@ -1595,13 +1631,17 @@ git block, slug, runtime size, encrypted secrets) with the Data Science API
     tracked on another branch's tree are never planned as creates -- they ride along on
     the result envelope under `orphaned` instead (see sync diff). --dry-run agrees.
 
-  kbagent sync clone --source DIR --target ALIAS --target-dir DIR [--bucket-map FILE] [--variable-values FILE] [--instance-rename FILE] [--dry-run] [--branch ID]
+  kbagent sync clone --source DIR --target ALIAS --target-dir DIR [--bucket-map FILE] [--variable-values FILE] [--instance-rename FILE] [--no-create-buckets] [--dry-run] [--branch ID]
     Clone a reference synced tree into a fresh target project + parameterize it
     (bucket_map / variable_values / instance_rename overrides), then push so every
     config CREATEs fresh. keboola.flow task configIds + variable links remap
     reference->ULID. Idempotent (re-run -> no_changes); needs a fresh target.
     Override files must be flat {{id: scalar}} mappings (0.89.0+); a nested/list/null
     value -> CONFIG_ERROR naming the key + type.
+    Clone recreates the reference's storage buckets in the target from
+    storage/buckets.json BY DEFAULT (--no-create-buckets skips it; buckets only,
+    not tables/data). A linked (shared) bucket is linked to the same source as in
+    the reference (listed in linked_buckets; a refused link -> bucket_errors).
     Note: --dry-run still creates --target-dir on disk (copy + overrides + manifest)
     but does not push.
 
@@ -1672,7 +1712,9 @@ MISSING_MASTER_TOKEN (exit 3) with the remedy (#711). Pre-flight:
     Basic structural checks (duplicates, dangling refs, sum-on-pct,
     constraint orphans, severity-suffix). --deep adds parallel Snowflake
     column-existence checks for phantom fields, phantom column refs, and
-    AGG-on-STRING via in-process StorageService.
+    AGG-on-STRING via in-process StorageService, plus an FQN_MISMATCH warning
+    for a dataset `fqn` that is not the table's Storage location (since 0.95.0;
+    models built before 0.95.0 carry a nonexistent "KEBOOLA" database).
 
   kbagent semantic-layer export --project P [--model M] [--output PATH]
     Snapshot the model to a self-describing JSON file. Default path:
@@ -1697,7 +1739,10 @@ MISSING_MASTER_TOKEN (exit 3) with the remedy (#711). Pre-flight:
     columns (account_code, account_name, parent_code, is_leaf, ...).
 
   kbagent semantic-layer add metric|dataset|relationship|constraint|glossary ...
-    Add one entity. Dataset auto-derives `fqn` from --table-id; --deep-fields
+    Add one entity. Dataset `fqn` is the table's warehouse location read from
+    Storage (bucket backendPath = `storage table-detail` sql_path; a linked
+    bucket points at the SOURCE project's database + schema), so the table must
+    exist; `--fqn FQN` stores a value verbatim instead. --deep-fields
     fetches the storage schema and synthesises role-classified fields
     (PK_/FK_->key, *_DATE/*_DT->timestamp, numeric amount/value/rate->measure,
     else dimension). Constraint name regex `^[a-z][a-z0-9_]*$`, severity is
@@ -1744,7 +1789,7 @@ MISSING_MASTER_TOKEN (exit 3) with the remedy (#711). Pre-flight:
     Non-interactive heuristic builder. AI caveat: the ai_client has no
     arbitrary-JSON endpoint, so `build` falls back to a deterministic
     heuristic (one dataset + one COUNT(*) metric + one glossary entry per
-    table; FQN derived; fields[] role-classified). Response carries
+    table; FQN from the table's Storage location; fields[] role-classified). Response carries
     `fallback_used: "heuristic"`. Push loop iterates all 5 child types in
     dependency order (fixes the long-standing sl-build skill bug where
     semantic-constraint was silently dropped). On push failure rolls back

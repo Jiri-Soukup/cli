@@ -449,6 +449,31 @@ kbagent auth register-projects [--stack URL|alias] [--all] [--project-id ID ...]
 #   starts the server but no `/auth/*` operation is destructive, so it affects nothing here.
 #   See docs/web-server.md.
 
+kbagent project create --url URL [--project ALIAS] [--name NAME] [--backend snowflake|bigquery] [--sync-backend-init]
+# project create (since 0.95.0, DMD-1940): the ONLY kbagent command that works from nothing --
+#   no account, no token, no `auth login`. POSTs the unauthenticated provisioning endpoint
+#   (`/manage/programmatic-projects`, gated by the `agent-provisioning` stack feature
+#   / `STACK_FEATURES__AGENT_PROVISIONING`, off on most stacks -- the COMMAND is always
+#   registered, so `--help` proves nothing about the stack; without the feature the stack 404s
+#   and this exits 1 with AUTH_NOT_SUPPORTED_ON_STACK, naming the flag and the browser path),
+#   stores the returned project-pinned session in auth.json, and registers the project in
+#   config.json under the `kbc-session://` sentinel -- becoming the default project when nothing
+#   else was registered. THE PROJECT IT CREATES IS OWNED BY NOBODY: the result's `confirm_url` is a
+#   single-use, days-limited link a human must open and sign in at to take ownership; relay it
+#   verbatim. `auth status` re-prints it as `agent_confirm_url` while it is pending, so losing the
+#   terminal is recoverable -- losing the claim window is not. Confirming REVOKES this session, so
+#   the documented next step is `kbagent auth login --stack URL`; the alias survives it (the
+#   sentinel keys on project id + stack, never on the session). Refuses with exit 5 when a session
+#   for that stack already exists -- auth.json holds one session per stack, and whoever has one has
+#   an account and should create the project in the UI. `--backend` omitted keeps the stack
+#   maintainer's own default; `--sync-backend-init` waits for backend init instead of the async
+#   default (which warns that the first Storage command may fail until it lands). The provisioning
+#   POST is never auto-retried on 5xx/429 -- it is not idempotent, and each success creates an
+#   organization, a billable project and a credit grant. A timeout is classified rather than
+#   lumped together: a connect timeout never reached the stack (retryable), a READ timeout was
+#   delivered and may have succeeded (retryable:false, message says not to repeat -- check
+#   `auth status`, whose stored session + claim link is the evidence). `--sync-backend-init`
+#   raises that call's read timeout to 300s, which can outlast an agent's foreground shell.
 kbagent project add --project NAME --url URL --token TOKEN
 kbagent project list
 kbagent project remove --project NAME
@@ -563,6 +588,9 @@ kbagent storage table-detail --project NAME --table-id ID [--branch ID]
 #   partition from INFORMATION_SCHEMA.PARTITIONS). `definition` is present on EVERY response
 #   -- untyped tables get one too -- so null means the stack omitted the key, NOT "untyped".
 #   `storage tables` (the LIST endpoint) is unaffected: the API has no `definition` include.
+#   table-detail also returns `backend_path` (the owning bucket's Storage backendPath, verbatim)
+#   and `sql_path` (quoted, directly queryable path; null when Storage reports no location) --
+#   see the semantic-layer dataset fqn note (#761); version gate in gotchas.md.
 kbagent storage create-bucket --project NAME --stage STAGE --name NAME [--description D] [--backend B] [--branch ID]
 kbagent storage create-table --project NAME --bucket-id ID --name NAME [--column COL:TYPE[(length)] ...] [--primary-key COL] [--not-null COL ...] [--default NAME=VALUE ...] [--source-table-id ID] [--source-branch-id N] [--time-partitioning-type DAY|HOUR|MONTH|YEAR] [--time-partitioning-field COL] [--time-partitioning-expiration-ms MS] [--range-partitioning-field COL --range-partitioning-start S --range-partitioning-end E --range-partitioning-interval I] [--clustering-field COL ...] [--branch ID] [--if-not-exists]
 # --column XOR --source-table-id (0.66.0+, BigQuery only): --source-table-id copies an existing table's data into the requested partition/clustering layout (schema derived from source) -> swap into place with swap-tables. Partition/clustering flags work in both modes (BigQuery only); time vs range partitioning are mutually exclusive. A non-BigQuery project fails fast (pre-flight backend check).
@@ -938,8 +966,8 @@ kbagent sync push --project ALIAS [--all-projects] [--dry-run] [--force] [--allo
 #   with SYNC_LEGACY_BOUNDARY telling you to pull first; genuine edits push normally.
 # sync diff/push (0.89.0+, #649): local side read from exactly ONE tree (target branch subtree, else main/); entries tracked on another branch's tree are excluded from the changeset and reported under orphaned[] + summary.orphaned (reasons + reconcile hints); fix with sync pull. Adopt-by-id is branch-aware.
 # Ignored components (since 0.91.0, #689): keboola.mcp-server-tool joins keboola.sandboxes on ALWAYS_IGNORED_COMPONENTS (the MCP server's auto-created empty mcp-workspace-<hex> configs); the manifest field ignoredComponents (.keboola/manifest.json) is now LIVE and unions with the hardcoded set, honored by pull/diff/push. pull drops manifest entries + local dirs for a newly-ignored component, reported with action "ignored" (distinct from "removed" = deleted on remote); diff filters the local side too, so a stale dir for an ignored component can never classify as DELETED -- closes the delete-dir-then-push trap that used to destroy production keboola.mcp-server-tool configs.
-kbagent sync clone --source DIR --target ALIAS --target-dir DIR [--bucket-map FILE] [--variable-values FILE] [--instance-rename FILE] [--dry-run] [--branch ID]
-# `sync clone` (0.63.0+) copies a reference synced tree into a fresh target project + parameterizes it: applies bucket_map / variable_values / instance_rename overrides (JSON/YAML files), then pushes so every config CREATEs fresh -- keboola.flow task configIds and transformation variable links are remapped reference->ULID by push Phase C/D. Idempotent: re-run with an existing --target-dir reports no_changes. Fails fast if the target already contains the reference's configs (clone needs a fresh target). Override files must be flat {id: scalar} mappings (0.89.0+): a nested mapping/list/null value is rejected with CONFIG_ERROR naming the key + actual type, instead of being silently stringified into a bogus ID. `--branch` is optional on a fresh clone. It defaults to the target's production branch, resolved from the API like `sync init`. Pass it only to target a dev branch of the target.
+kbagent sync clone --source DIR --target ALIAS --target-dir DIR [--bucket-map FILE] [--variable-values FILE] [--instance-rename FILE] [--no-create-buckets] [--dry-run] [--branch ID]
+# `sync clone` (0.63.0+) copies a reference synced tree into a fresh target project + parameterizes it: applies bucket_map / variable_values / instance_rename overrides (JSON/YAML files), then pushes so every config CREATEs fresh -- keboola.flow task configIds and transformation variable links are remapped reference->ULID by push Phase C/D. Idempotent: re-run with an existing --target-dir reports no_changes. Fails fast if the target already contains the reference's configs (clone needs a fresh target). Override files must be flat {id: scalar} mappings (0.89.0+): a nested mapping/list/null value is rejected with CONFIG_ERROR naming the key + actual type, instead of being silently stringified into a bogus ID. `--branch` is optional on a fresh clone. It defaults to the target's production branch, resolved from the API like `sync init`. Pass it only to target a dev branch of the target. Clone recreates the reference tree's storage buckets in the target from the `storage/buckets.json` pull export BY DEFAULT -- `--no-create-buckets` skips it. Idempotent: an existing bucket is skipped, a per-bucket failure is collected in `bucket_errors`, a linked (shared) bucket is linked to the same source as in the reference (listed in `linked_buckets`; the source's sharing settings decide, a refused link lands in `bucket_errors`). Only the buckets are created, never their tables or data (the export carries no table data). Version gate in gotchas.md.
 kbagent sync branch-link --project ALIAS (--branch-id ID | --branch-name NAME) [--directory DIR]
 kbagent sync branch-unlink [--directory DIR]
 kbagent sync branch-status [--directory DIR]
@@ -981,7 +1009,17 @@ kbagent semantic-layer validate --project P [--model M] [--deep]
 kbagent semantic-layer export --project P [--model M] [--output PATH]
 kbagent semantic-layer diff (--project-a A | --file-a PATH) (--project-b B | --file-b PATH) [--model-a M] [--model-b M]
 kbagent semantic-layer add metric --project P [--model M] --name N --sql SQL --dataset TABLE_ID [--description D] [--yes]
-kbagent semantic-layer add dataset --project P [--model M] --name N --table-id TABLE_ID [--description D] [--grain G] [--primary-key COL ...] [--deep-fields]
+kbagent semantic-layer add dataset --project P [--model M] --name N --table-id TABLE_ID [--description D] [--grain G] [--primary-key COL ...] [--deep-fields] [--fqn FQN]
+# dataset fqn (#761): `add dataset` and `build` read the fqn from the table's Storage location --
+#   the owning bucket's backendPath, surfaced as `sql_path` / `backend_path` on `storage table-detail`.
+#   They used to hardcode a "KEBOOLA" database that exists in no project, so every consumer pasting
+#   the fqn into SQL failed. A LINKED bucket's path names the SOURCE project's database + schema;
+#   swapping in the consuming project's database does not resolve either. `add dataset` now needs
+#   the table to exist (one table-detail call) unless `--fqn` supplies the value verbatim; a table
+#   whose location Storage does not report fails with VALIDATION_ERROR. `build --types-workspace`
+#   queries INFORMATION_SCHEMA in that same database/schema. `validate --deep` warns FQN_MISMATCH
+#   on stored fqns that differ (pre-fix models); repair via export -> fix fqn + metric sql -> import
+#   --overwrite. Version gate lives in gotchas.md (no `(since vNEXT)` on `# ` lines).
 kbagent semantic-layer add relationship --project P [--model M] --name N --from TABLE_ID --to TABLE_ID --on EXPR [--type left|inner]
 kbagent semantic-layer add constraint --project P [--model M] --name N --constraint-type inequality|equality|range|composition|exclusion|temporal|conditional --rule "EXPR" --metrics M1,M2 [--severity error|warning|info]
 kbagent semantic-layer add glossary --project P [--model M] --term TERM [--definition D]
