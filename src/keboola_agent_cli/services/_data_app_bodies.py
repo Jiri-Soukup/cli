@@ -229,6 +229,8 @@ def _build_managed_git_block(repo: dict[str, Any], app_id: str) -> dict[str, Any
             status_code=500,
             retryable=False,
         )
+    # get_git_repo carries no branch field, so "main" is the documented contract
+    # (data-app-workflow.md: push the managed repo's code to main).
     return {"repository": git_url, "branch": "main", "private": True}
 
 
@@ -266,7 +268,20 @@ def backfill_managed_git(
         change_description="Auto-backfill managed-repo git block (workspace provisioning fix)",
         branch_id=ctx.branch_id,
     )
-    new_version = str(updated.get("version", "") or ctx.latest_version)
+    new_version = str(updated.get("version", "") or "")
+    if not new_version:
+        # Falling back to ctx.latest_version would pin the pre-backfill config --
+        # the exact no-workspace state this backfill exists to fix. Fail loudly,
+        # mirroring create_data_app's handling of the same missing-version case.
+        raise KeboolaApiError(
+            message=(
+                "Storage API did not return a version after backfilling the "
+                "managed-repo git block; cannot pin configVersion for deploy."
+            ),
+            status_code=500,
+            error_code=ErrorCode.API_ERROR,
+            retryable=False,
+        )
     logger.info(
         "Backfilled parameters.dataApp.git for managed-repo app %s (config %s); "
         "Storage version %s -> %s",

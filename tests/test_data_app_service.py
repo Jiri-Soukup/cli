@@ -1179,6 +1179,32 @@ class TestDataAppDeploy:
         storage_mock.update_config.assert_not_called()
         ds_mock.patch_app.assert_not_called()
 
+    def test_deploy_pure_managed_raises_when_backfill_returns_no_version(
+        self, tmp_path: Path
+    ) -> None:
+        """The backfill PUT returned no version -- falling back to the pre-backfill
+        version would deploy the no-git-block config (the CLI-15 bug), so fail
+        loudly instead of deploying."""
+        store = _make_store(tmp_path)
+        service, ds_mock, storage_mock, _enc = _make_service(store)
+        ds_mock.get_app.return_value = {"configId": "ulid", "hasManagedGitRepo": True}
+        storage_mock.get_config_detail.return_value = {
+            "version": 4,
+            "configuration": {"parameters": {"dataApp": {"slug": "x"}}},
+        }
+        ds_mock.get_git_repo.return_value = {
+            "sshUrl": None,
+            "httpsUrl": "https://git.example.com/keboola/app-42.git",
+            "isManagedGitRepo": True,
+        }
+        storage_mock.update_config.return_value = {}
+
+        with pytest.raises(KeboolaApiError, match="did not return a version"):
+            service.deploy_data_app(alias="prod", app_id="42")
+
+        storage_mock.update_config.assert_called_once()
+        ds_mock.patch_app.assert_not_called()
+
     def test_deploy_managed_with_git_block_pins_latest(self, tmp_path: Path) -> None:
         """Once a credential is wired (parameters.dataApp.git present), the source
         pointer lives in Storage, so the latest configVersion is pinned."""
